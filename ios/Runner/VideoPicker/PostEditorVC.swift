@@ -2,7 +2,7 @@
 //  PostEditorVC.swift
 //  Runner
 //
-//  Updated: 2025-06-25
+//  Updated: 2025-06-26
 //
 
 import UIKit
@@ -86,6 +86,24 @@ final class PostEditorVC: UIViewController {
   ]
   private var currentFilterName: String?
   private var filterBar: UICollectionView?
+  private var startupLoader: UIActivityIndicatorView?
+
+  // MARK: loader helpers
+  private func showStartupLoader() {
+    guard startupLoader == nil else { return }
+    let sp = UIActivityIndicatorView(style: .large)
+    sp.color = .white; sp.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(sp); startupLoader = sp
+    NSLayoutConstraint.activate([
+      sp.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      sp.centerYAnchor.constraint(equalTo: view.centerYAnchor)])
+    sp.startAnimating()
+  }
+  private func hideStartupLoader() {
+    startupLoader?.stopAnimating()
+    startupLoader?.removeFromSuperview()
+    startupLoader = nil
+  }
 
   // MARK: UI refs
   private var nextBtn: UIButton!
@@ -142,6 +160,7 @@ final class PostEditorVC: UIViewController {
   // MARK: life-cycle
   override func viewDidLoad() {
     super.viewDidLoad(); view.backgroundColor = .black
+    showStartupLoader()
     setupPlayer()
     view.addSubview(overlayContainer)
     setupUI()
@@ -155,7 +174,7 @@ final class PostEditorVC: UIViewController {
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
     playerLayer.frame = view.bounds
-    playerLayer.videoGravity = .resizeAspect        // aspect-fit (letter-box)
+    playerLayer.videoGravity = .resizeAspect
     overlayContainer.frame = view.bounds
   }
 
@@ -164,17 +183,25 @@ final class PostEditorVC: UIViewController {
     playerItem = AVPlayerItem(url: videoURL)
     player = AVPlayer(playerItem: playerItem)
     player.actionAtItemEnd = .none
-    NotificationCenter.default.addObserver(forName:.AVPlayerItemDidPlayToEndTime,
-                                           object:playerItem,queue:.main){[weak self]_ in
-      self?.player.seek(to:.zero); self?.player.play()}
+
+    playerItem.asset.loadValuesAsynchronously(forKeys: ["playable"]) { [weak self] in
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.hideStartupLoader()
+        self.player.play()
+      }
+    }
+
+    NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime,
+                                           object: playerItem, queue: .main) { [weak self] _ in
+      self?.player.seek(to: .zero); self?.player.play() }
+
     playerLayer = AVPlayerLayer(player: player)
     view.layer.insertSublayer(playerLayer, at: 0)
-    player.play()
   }
 
   // MARK: UI setup
   private func setupUI() {
-    // side tray
     let items:[(String,String,Selector)] = [
       ("Aa","textformat",#selector(addTextTapped)),
       ("🙂","face.smiling",#selector(stickerTapped)),
@@ -281,10 +308,10 @@ final class PostEditorVC: UIViewController {
   // MARK: next
   @objc private func nextPressed() {
     Haptics.tap(); showLoader("Exporting…")
-    exportVideo { [weak self] vid,_ in
+    exportVideo { [weak self] vid, thumb in
       guard let self else { return }
       self.hideLoader(); guard let vid else { Haptics.error(); return }
-      self.dismiss(animated:true){ self.completion?(vid,nil) }
+      self.dismiss(animated:true){ self.completion?(vid, thumb) }
     }
   }
 
@@ -341,9 +368,23 @@ final class PostEditorVC: UIViewController {
     player.replaceCurrentItem(with:newItem); player.play()
   }
 
+  // MARK: – thumbnail
+  private func makeThumbnail(for video: URL) -> URL? {
+    let asset     = AVAsset(url: video)
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    guard let cg = try? generator.copyCGImage(at: .init(seconds:0, preferredTimescale:600),
+                                              actualTime:nil) else { return nil }
+    let data  = UIImage(cgImage: cg).jpegData(compressionQuality:0.8)
+    let out   = FileManager.default.temporaryDirectory
+                 .appendingPathComponent(UUID().uuidString + ".jpg")
+    try? data?.write(to: out)
+    return out
+  }
+
   // MARK: EXPORT
   private func exportVideo(completion:@escaping(URL?,URL?)->Void){
-    DispatchQueue.global(qos:.userInitiated).async{ [weak self] in
+    DispatchQueue.global(qos:.userInitiated).async { [weak self] in
       guard let self else { return }
 
       // base comp
@@ -362,11 +403,11 @@ final class PostEditorVC: UIViewController {
                                     of:aSrc,at:.zero)
       }
 
-      // renderSize = full screen
+      // renderSize
       let renderSize = self.overlayContainer.bounds.size
 
       // aspect-fit transform
-      let nat = vSrc.naturalSize.applying(vSrc.preferredTransform)
+      let nat  = vSrc.naturalSize.applying(vSrc.preferredTransform)
       let srcW = abs(nat.width), srcH = abs(nat.height)
       let scale = min(renderSize.width/srcW, renderSize.height/srcH)
       let trans = CGAffineTransform(scaleX:scale,y:scale)
@@ -386,33 +427,25 @@ final class PostEditorVC: UIViewController {
       let parent = CALayer(); parent.frame = .init(origin:.zero,size:renderSize)
       let videoLayer = CALayer(); videoLayer.frame = parent.frame; parent.addSublayer(videoLayer)
 
-        func overlay(from v: UIView) -> CALayer {
-            let cg = v.snapshotImage().cgImage!
-            let ly = CALayer(); ly.contents = cg
+      func overlay(from v: UIView) -> CALayer {
+        let cg = v.snapshotImage().cgImage!
+        let ly = CALayer(); ly.contents = cg
 
-            // 1. scale & position   (unchanged)
-            let ov = self.overlayContainer.bounds
-            let sx = renderSize.width  / ov.width
-            let sy = renderSize.height / ov.height
-            ly.bounds   = .init(x: 0, y: 0,
-                                width: v.bounds.width  * sx,
-                                height: v.bounds.height * sy)
-            ly.position = .init(x: v.center.x * sx,
-                                y: (ov.height - v.center.y) * sy)
-            ly.anchorPoint = .init(x: 0.5, y: 0.5)
+        let ov = self.overlayContainer.bounds
+        let sx = renderSize.width  / ov.width
+        let sy = renderSize.height / ov.height
+        ly.bounds   = .init(x:0,y:0,width: v.bounds.width*sx, height: v.bounds.height*sy)
+        ly.position = .init(x: v.center.x*sx, y: (ov.height - v.center.y)*sy)
+        ly.anchorPoint = .init(x:0.5,y:0.5)
 
-            // 2. rotation & scale   (flip the sign of the angle)
-            let t   = v.transform
-            let rot = atan2(t.b, t.a)          // UIKit angle (clockwise ↓)
-            let sX  = sqrt(t.a*t.a + t.c*t.c)  // X-scale
-            let sY  = sqrt(t.b*t.b + t.d*t.d)  // Y-scale
+        let t   = v.transform
+        let rot = atan2(t.b,t.a)
+        let sX  = sqrt(t.a*t.a + t.c*t.c)
+        let sY  = sqrt(t.b*t.b + t.d*t.d)
 
-            ly.setAffineTransform(
-                CGAffineTransform(rotationAngle: -rot)   // ← negate to un-mirror
-                  .scaledBy(x: sX, y: sY)
-            )
-            return ly
-        }
+        ly.setAffineTransform(CGAffineTransform(rotationAngle:-rot).scaledBy(x:sX,y:sY))
+        return ly
+      }
       captions.forEach{ parent.addSublayer(overlay(from:$0)) }
       stickers.forEach{ parent.addSublayer(overlay(from:$0)) }
       vc.animationTool = AVVideoCompositionCoreAnimationTool(
@@ -420,16 +453,20 @@ final class PostEditorVC: UIViewController {
 
       // export
       guard let ex = AVAssetExportSession(asset:comp,
-                      presetName:AVAssetExportPresetHighestQuality) else {
+                    presetName:AVAssetExportPresetHighestQuality) else {
         DispatchQueue.main.async{ completion(nil,nil) }; return }
       let out = FileManager.default.temporaryDirectory
-                 .appendingPathComponent(UUID().uuidString+".mov")
+                 .appendingPathComponent(UUID().uuidString + ".mov")
       ex.outputURL = out; ex.outputFileType = .mov
       ex.videoComposition = vc; ex.shouldOptimizeForNetworkUse = true
-      ex.exportAsynchronously{
-        ex.status == .completed ?
-          DispatchQueue.main.async{ completion(out,nil) } :
-          DispatchQueue.main.async{ completion(nil,nil) }
+      ex.exportAsynchronously { [weak self] in
+        guard let self else { DispatchQueue.main.async{ completion(nil,nil) }; return }
+        if ex.status == .completed {
+          let thumb = self.makeThumbnail(for: out)
+          DispatchQueue.main.async { completion(out, thumb) }
+        } else {
+          DispatchQueue.main.async { completion(nil,nil) }
+        }
       }
     }
   }

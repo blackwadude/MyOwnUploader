@@ -2,7 +2,7 @@
 //  PostEditorVC.swift
 //  Runner
 //
-//  Updated: 2025-06-10 – exports video + PNG thumbnail + quick “download” button
+//  Updated: 2025-06-25
 //
 
 import UIKit
@@ -10,767 +10,530 @@ import AVFoundation
 import PhotosUI
 import Photos
 import CoreImage
+import Metal
 
-
-// MARK: – CIFilter video compositor
-// MARK: – CIFilter video compositor
+// MARK: – CIFilter compositor (unchanged)
 final class FilterCompositor: NSObject, AVVideoCompositing {
 
   static var filterName: String?
-  static var preferredTransform: CGAffineTransform = .identity
-    
-    private var needsExtraYFlip: Bool {
-        Self.preferredTransform.d >= 0     //  +1  ➜  still needs the CI→AV flip
-    }
+  static var preferredTransform = CGAffineTransform.identity
+  private var needsFlip: Bool { Self.preferredTransform.d >= 0 }
 
-  // ───────── boiler-plate ─────────
-  private let queue = DispatchQueue(label: "filter.render")
+  private let q = DispatchQueue(label: "filter.render")
   private var ctx: AVVideoCompositionRenderContext?
 
-  var sourcePixelBufferAttributes: [String : Any]? {
+  var sourcePixelBufferAttributes: [String: Any]? {
     [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
   }
-  var requiredPixelBufferAttributesForRenderContext: [String : Any] {
+  var requiredPixelBufferAttributesForRenderContext: [String: Any] {
     sourcePixelBufferAttributes!
   }
-  func renderContextChanged(_ new: AVVideoCompositionRenderContext) {
-    queue.sync { ctx = new }
-  }
-    
+  func renderContextChanged(_ new: AVVideoCompositionRenderContext) { q.sync { ctx = new } }
 
-  // ───────── main render loop ─────────
-  func startRequest(_ req: AVAsynchronousVideoCompositionRequest) {
+  func startRequest(_ r: AVAsynchronousVideoCompositionRequest) {
     autoreleasepool {
-      guard
-        let src = req.sourceFrame(byTrackID: req.sourceTrackIDs[0].int32Value),
-        let dst = ctx?.newPixelBuffer()
-      else {
-        req.finish(with: NSError(domain:"FilterCompositor", code:0)); return
-      }
+      guard let src = r.sourceFrame(byTrackID: r.sourceTrackIDs[0].int32Value),
+            let dst = ctx?.newPixelBuffer() else {
+        r.finish(with: NSError(domain: "FilterCompositor", code: 0)); return }
 
-      //-------------------------------------------
-      // 1️⃣ start with raw frame
-      //-------------------------------------------
       var img = CIImage(cvPixelBuffer: src)
-
-      //-------------------------------------------
-      // 2️⃣ rotate into portrait
-      //-------------------------------------------
       img = img.transformed(by: Self.preferredTransform)
-
-      //-------------------------------------------
-      // 3️⃣ translate to origin, then Y-flip
-      //-------------------------------------------
-      let ext   = img.extent
-      let shift = CGAffineTransform(translationX: -ext.origin.x,
-                                    y: -ext.origin.y)
-      img = img.transformed(by: shift)
-
-        // ----------------------------------------------------
-        // 4) Flip only if the incoming frame is NOT already
-        //    vertically mirrored (d = +1 means “upright”)  👇
-        // ----------------------------------------------------
-        if let canvas = ctx?.size {
-            if needsExtraYFlip {                      // <─── only when required
-                let flip = CGAffineTransform(scaleX: 1, y: -1)
-                              .translatedBy(x: 0, y: -canvas.height)
-                img = img.transformed(by: flip)
-            }
-            img = img.cropped(to: CGRect(origin: .zero, size: canvas))
-        }
-
-      //-------------------------------------------
-      // 4️⃣ optional CIFilter
-      //-------------------------------------------
-      if let name = Self.filterName,
-         let f    = CIFilter(name: name) {
+      img = img.transformed(by: .init(translationX: -img.extent.origin.x,
+                                      y: -img.extent.origin.y))
+      if let s = ctx?.size, needsFlip {
+        img = img.transformed(by: .init(scaleX: 1, y: -1).translatedBy(x: 0, y: -s.height))
+        img = img.cropped(to: .init(origin: .zero, size: s))
+      }
+      if let n = Self.filterName, let f = CIFilter(name: n) {
         f.setValue(img, forKey: kCIInputImageKey)
         img = f.outputImage ?? img
       }
-
-      //-------------------------------------------
-      // 5️⃣ render
-      //-------------------------------------------
       CIContext().render(img, to: dst)
-      req.finish(withComposedVideoFrame: dst)
+      r.finish(withComposedVideoFrame: dst)
     }
   }
 }
-
-
-
 
 // MARK: – main
 final class PostEditorVC: UIViewController {
 
-  // MARK: – completion  (videoURL, thumbnailPNGURL?)
+  // MARK: completion
   var completion: ((URL, URL?) -> Void)?
 
-  // MARK: – init
+  // MARK: init
   private let fromGallery: Bool
   init(videoURL: URL, fromGallery: Bool) {
-    self.videoURL = videoURL
-    self.fromGallery = fromGallery
+    self.videoURL = videoURL; self.fromGallery = fromGallery
     super.init(nibName: nil, bundle: nil)
   }
   required init?(coder: NSCoder) { fatalError() }
 
-  // MARK: – video state
+  // MARK: video
   private var videoURL: URL
   private var player: AVPlayer!
   private var playerItem: AVPlayerItem!
-  private var wasPlayingBeforeTrim = false
   private var playerLayer: AVPlayerLayer!
+  private var wasPlayingBeforeTrim = false
 
-
-  // MARK: – overlays & filters
+  // MARK: overlays & filters
   private var captions: [EditableCaption] = []
   private var stickers: [DraggableSticker] = []
   private let filters: [(title: String, ciName: String?)] = [
-    ("None", nil), ("Mono", "CIPhotoEffectMono"), ("Noir", "CIPhotoEffectNoir"),
-    ("Fade", "CIPhotoEffectFade"), ("Instant", "CIPhotoEffectInstant"),
-    ("Process", "CIPhotoEffectProcess")
+    ("None", nil), ("Mono","CIPhotoEffectMono"), ("Noir","CIPhotoEffectNoir"),
+    ("Fade","CIPhotoEffectFade"), ("Instant","CIPhotoEffectInstant"),
+    ("Process","CIPhotoEffectProcess"), ("Chrome","CIPhotoEffectChrome"),
+    ("Transfer","CIPhotoEffectTransfer"), ("Tonal","CIPhotoEffectTonal")
   ]
   private var currentFilterName: String?
   private var filterBar: UICollectionView?
 
-  // MARK: – UI refs
+  // MARK: UI refs
   private var nextBtn: UIButton!
-    
-    // MARK: – loader / toast
-    private var loader: UIView?
 
-    private func showLoader(_ message: String? = nil) {
-      guard loader == nil else { return }
-      let bg = UIView(frame: view.bounds)
-      bg.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+  // MARK: overlay container (full-screen)
+  private let overlayContainer: UIView = {
+    let v = UIView(); v.backgroundColor = .clear; v.isUserInteractionEnabled = true; return v }()
 
-      let spinner = UIActivityIndicatorView(style: .large)
-      spinner.color = .white
-      spinner.translatesAutoresizingMaskIntoConstraints = false
-      spinner.startAnimating()
-      bg.addSubview(spinner)
+  // MARK: loader / toast
+  private var loader: UIView?
+  private func showLoader(_ message: String? = nil) {
+    guard loader == nil else { return }
+    let bg = UIView(frame: view.bounds)
+    bg.backgroundColor = UIColor.black.withAlphaComponent(0.55)
 
-      if let msg = message {
-        let label = UILabel()
-        label.text = msg
-        label.font = .systemFont(ofSize: 15, weight: .medium)
-        label.textColor = .white
-        label.translatesAutoresizingMaskIntoConstraints = false
-        bg.addSubview(label)
+    let sp = UIActivityIndicatorView(style: .large)
+    sp.color = .white; sp.translatesAutoresizingMaskIntoConstraints = false; sp.startAnimating()
+    bg.addSubview(sp)
 
-        NSLayoutConstraint.activate([
-          spinner.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
-          spinner.centerYAnchor.constraint(equalTo: bg.centerYAnchor, constant: -12),
-          label.topAnchor.constraint(equalTo: spinner.bottomAnchor, constant: 12),
-          label.centerXAnchor.constraint(equalTo: bg.centerXAnchor)
-        ])
-      } else {
-        NSLayoutConstraint.activate([
-          spinner.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
-          spinner.centerYAnchor.constraint(equalTo: bg.centerYAnchor)
-        ])
-      }
-
-      view.addSubview(bg)
-      loader = bg
+    if let msg = message {
+      let l = UILabel(); l.text = msg; l.font = .systemFont(ofSize: 15, weight: .medium)
+      l.textColor = .white; l.translatesAutoresizingMaskIntoConstraints = false; bg.addSubview(l)
+      NSLayoutConstraint.activate([
+        sp.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+        sp.centerYAnchor.constraint(equalTo: bg.centerYAnchor, constant: -12),
+        l.topAnchor.constraint(equalTo: sp.bottomAnchor, constant: 12),
+        l.centerXAnchor.constraint(equalTo: bg.centerXAnchor)
+      ])
+    } else {
+      NSLayoutConstraint.activate([
+        sp.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+        sp.centerYAnchor.constraint(equalTo: bg.centerYAnchor)
+      ])
     }
+    view.addSubview(bg); loader = bg
+  }
+  private func hideLoader() { loader?.removeFromSuperview(); loader = nil }
 
-    private func hideLoader() {
-      loader?.removeFromSuperview()
-      loader = nil
-    }
+  private func toast(_ text: String) {
+    let lbl = UILabel()
+    lbl.text = text; lbl.font = .systemFont(ofSize: 14, weight: .semibold)
+    lbl.textColor = .white; lbl.textAlignment = .center
+    lbl.backgroundColor = UIColor.black.withAlphaComponent(0.8)
+    lbl.layer.cornerRadius = 8; lbl.clipsToBounds = true
+    lbl.alpha = 0
+    lbl.frame = .init(x: 40, y: view.bounds.height*0.25,
+                      width: view.bounds.width-80, height: 36)
+    view.addSubview(lbl)
+    UIView.animate(withDuration:0.3,animations:{ lbl.alpha = 1 }){ _ in
+      UIView.animate(withDuration:0.3,delay:1.2,options:[]){ lbl.alpha = 0 } completion:{ _ in
+        lbl.removeFromSuperview()}}
+  }
 
-    /// Quick one-line toast
-    private func toast(_ text: String) {
-      let lbl = UILabel()
-      lbl.text = text
-      lbl.font = .systemFont(ofSize: 14, weight: .semibold)
-      lbl.textColor = .white
-      lbl.backgroundColor = UIColor.black.withAlphaComponent(0.8)
-      lbl.textAlignment = .center
-      lbl.layer.cornerRadius = 8
-      lbl.clipsToBounds = true
-      lbl.alpha = 0
-      lbl.frame = CGRect(x: 40,
-                         y: view.bounds.height * 0.25,
-                         width: view.bounds.width - 80,
-                         height: 36)
-      view.addSubview(lbl)
-
-      UIView.animate(withDuration: 0.3, animations: { lbl.alpha = 1 }) { _ in
-        UIView.animate(withDuration: 0.3, delay: 1.2, options: []) {
-          lbl.alpha = 0
-        } completion: { _ in lbl.removeFromSuperview() }
-      }
-    }
-
-
-  // MARK: – life-cycle
+  // MARK: life-cycle
   override func viewDidLoad() {
-    super.viewDidLoad()
-    view.backgroundColor = .black
+    super.viewDidLoad(); view.backgroundColor = .black
     setupPlayer()
-    setupSideTray()
-    setupBottomBar()
-    setupBackButton()
-
-    let tap = UITapGestureRecognizer(target: self,
-                                     action: #selector(handleViewTap(_:)))
-    tap.cancelsTouchesInView = false
-    view.addGestureRecognizer(tap)
-  }
-  override func viewDidAppear(_ animated: Bool) {
-    super.viewDidAppear(animated)
+    view.addSubview(overlayContainer)
+    setupUI()
     Haptics.prime()
+
+    // tap to dismiss keyboard / hide filter bar
+    let tap = UITapGestureRecognizer(target:self,
+                                     action:#selector(backgroundTapped(_:)))
+    tap.cancelsTouchesInView = false; view.addGestureRecognizer(tap)
+  }
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    playerLayer.frame = view.bounds
+    playerLayer.videoGravity = .resizeAspect        // aspect-fit (letter-box)
+    overlayContainer.frame = view.bounds
   }
 
-  // MARK: – player
+  // MARK: player
   private func setupPlayer() {
     playerItem = AVPlayerItem(url: videoURL)
     player = AVPlayer(playerItem: playerItem)
     player.actionAtItemEnd = .none
-    NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemDidPlayToEndTime,
-      object: playerItem,
-      queue: .main) { [weak self] _ in
-        self?.player.seek(to: .zero); self?.player.play()
-      }
-
-      playerLayer = AVPlayerLayer(player: player)
-      playerLayer.frame         = view.bounds
-      playerLayer.videoGravity  = .resizeAspectFill
-      view.layer.addSublayer(playerLayer)
+    NotificationCenter.default.addObserver(forName:.AVPlayerItemDidPlayToEndTime,
+                                           object:playerItem,queue:.main){[weak self]_ in
+      self?.player.seek(to:.zero); self?.player.play()}
+    playerLayer = AVPlayerLayer(player: player)
+    view.layer.insertSublayer(playerLayer, at: 0)
     player.play()
   }
 
-  // MARK: – side tray
-  private func setupSideTray() {
-    let items: [(String,String,Selector)] = [
-      ("Aa","textformat",          #selector(textTapped)),
-      ("Fx","sparkles",            #selector(filterTapped)),
-      ("🙂","face.smiling",        #selector(stickerTapped)),
-      ("✂︎","scissors",            #selector(trimTapped)),
-      ("↓","arrow.down.circle",    #selector(downloadTapped)) // NEW
-    ]
-
-    let stack = UIStackView()
-    stack.axis = .vertical
-    stack.alignment = .center
-    stack.spacing = 22
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(stack)
-
-    items.forEach { _, sf, sel in
-      let b = UIButton(type: .system)
-      b.setImage(UIImage(systemName: sf), for: .normal)
+  // MARK: UI setup
+  private func setupUI() {
+    // side tray
+    let items:[(String,String,Selector)] = [
+      ("Aa","textformat",#selector(addTextTapped)),
+      ("🙂","face.smiling",#selector(stickerTapped)),
+      ("Fx","sparkles",#selector(filterTapped)),
+      ("✂︎","scissors",#selector(trimTapped)),
+      ("↓","arrow.down.circle",#selector(downloadTapped))]
+    let tray = UIStackView(); tray.axis = .vertical; tray.spacing = 22; tray.alignment = .center
+    tray.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(tray)
+    items.forEach{ _,sf,sel in
+      let b = UIButton(type:.system)
+      b.setImage(UIImage(systemName:sf),for:.normal)
       b.tintColor = .white
-      b.widthAnchor.constraint(equalToConstant: 32).isActive = true
-      b.heightAnchor.constraint(equalTo: b.widthAnchor).isActive = true
-      b.addTarget(self, action: sel, for: .touchUpInside)
-      stack.addArrangedSubview(b)
-    }
+      b.widthAnchor.constraint(equalToConstant:32).isActive = true
+      b.heightAnchor.constraint(equalTo:b.widthAnchor).isActive = true
+      b.addTarget(self,action:sel,for:.touchUpInside)
+      tray.addArrangedSubview(b) }
     NSLayoutConstraint.activate([
-      stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-      stack.centerYAnchor.constraint(equalTo: view.centerYAnchor)
-    ])
-  }
+      tray.trailingAnchor.constraint(equalTo:view.trailingAnchor,constant:-16),
+      tray.centerYAnchor.constraint(equalTo:view.centerYAnchor)])
 
-  // MARK: – bottom bar (“Next”)
-  private func setupBottomBar() {
-    let bar = UIView()
-    bar.backgroundColor = UIColor.black.withAlphaComponent(0.85)
-    bar.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(bar)
-
-    nextBtn = makePill("Next", #selector(nextPressed))
-    nextBtn.translatesAutoresizingMaskIntoConstraints = false
-    bar.addSubview(nextBtn)
-
+    // bottom bar
+    let bottom = UIView()
+    bottom.backgroundColor = UIColor.black.withAlphaComponent(0.85)
+    bottom.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(bottom)
+    nextBtn = UIButton(type:.system)
+    nextBtn.setTitle("Next",for:.normal)
+    nextBtn.titleLabel?.font = .boldSystemFont(ofSize:15)
+    nextBtn.tintColor = .white; nextBtn.backgroundColor = .black
+    nextBtn.layer.cornerRadius = 22; nextBtn.layer.borderWidth = 2
+    nextBtn.layer.borderColor = UIColor.white.cgColor
+    nextBtn.addTarget(self,action:#selector(nextPressed),for:.touchUpInside)
+    nextBtn.translatesAutoresizingMaskIntoConstraints = false; bottom.addSubview(nextBtn)
     NSLayoutConstraint.activate([
-      bar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      bar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      bar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-      bar.heightAnchor.constraint(equalToConstant: 90),
+      bottom.leadingAnchor.constraint(equalTo:view.leadingAnchor),
+      bottom.trailingAnchor.constraint(equalTo:view.trailingAnchor),
+      bottom.bottomAnchor.constraint(equalTo:view.bottomAnchor),
+      bottom.heightAnchor.constraint(equalToConstant:90),
+      nextBtn.trailingAnchor.constraint(equalTo:bottom.trailingAnchor,constant:-20),
+      nextBtn.centerYAnchor.constraint(equalTo:bottom.centerYAnchor),
+      nextBtn.widthAnchor.constraint(equalToConstant:120),
+      nextBtn.heightAnchor.constraint(equalToConstant:44)])
 
-      nextBtn.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -20),
-      nextBtn.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
-
-      
-      nextBtn.widthAnchor.constraint(equalToConstant: 120),
-      nextBtn.heightAnchor.constraint(equalToConstant: 44)
-    ])
-  }
-  private func makePill(_ title: String, _ action: Selector) -> UIButton {
-    let b = UIButton(type: .system)
-    b.setTitle(title, for: .normal)
-    b.titleLabel?.font = .boldSystemFont(ofSize: 15)
-    b.tintColor = .white
-    b.backgroundColor = .black
-    b.layer.cornerRadius = 22
-    b.layer.borderWidth = 2
-    b.layer.borderColor = UIColor.white.cgColor
-    b.addTarget(self, action: action, for: .touchUpInside)
-    return b
-  }
-
-  // MARK: – back button
-  private func setupBackButton() {
-    let back = UIButton(type: .system)
-    back.setImage(UIImage(systemName: "chevron.backward"), for: .normal)
-    back.tintColor = .white
-    back.translatesAutoresizingMaskIntoConstraints = false
-    back.addTarget(self, action: #selector(backPressed), for: .touchUpInside)
+    // back
+    let back = UIButton(type:.system)
+    back.setImage(UIImage(systemName:"chevron.backward"),for:.normal)
+    back.tintColor = .white; back.translatesAutoresizingMaskIntoConstraints = false
+    back.addTarget(self,action:#selector(backPressed),for:.touchUpInside)
     view.addSubview(back)
     NSLayoutConstraint.activate([
-      back.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-      back.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16)
-    ])
+      back.leadingAnchor.constraint(equalTo:view.leadingAnchor,constant:16),
+      back.topAnchor.constraint(equalTo:view.safeAreaLayoutGuide.topAnchor,constant:16)])
   }
 
-  // MARK: – quick-tool taps
-  @objc private func textTapped() {
+  // MARK: quick-tool taps
+  @objc private func addTextTapped() {
     Haptics.tap()
     let c = EditableCaption()
-    c.delegate = self
-    c.actionDelegate = self
-    c.frame = CGRect(x: 0, y: 0, width: 200, height: 50)
-    c.center = view.center
-    view.addSubview(c)
-    captions.append(c)
+    c.delegate = self; c.actionDelegate = self
+    c.frame = .init(x:0,y:0,width:200,height:50)
+    c.center = overlayContainer.center
+    overlayContainer.addSubview(c); captions.append(c)
+  }
+  @objc private func stickerTapped() {
+    Haptics.tap()
+    let picker = EmojiPickerVC(); picker.delegate = self; present(picker, animated: true)
+  }
+  private func addSticker(_ img: UIImage) {
+    let s = DraggableSticker(image: img)
+    s.center = overlayContainer.center
+    s.actionDelegate = self
+    overlayContainer.addSubview(s); stickers.append(s)
   }
   @objc private func filterTapped() { Haptics.tap(); toggleFilterBar() }
-    
-    @objc private func stickerTapped() {
-        Haptics.tap()
 
-        let picker = EmojiPickerVC()
-        picker.delegate = self
-
-        // Pop-over on iPad, sheet on iPhone
-        picker.modalPresentationStyle = traitCollection.userInterfaceIdiom == .pad
-            ? .popover : .pageSheet
-        if let pop = picker.popoverPresentationController {
-            pop.sourceView = view
-            pop.sourceRect = CGRect(x: view.bounds.midX,
-                                    y: view.bounds.maxY - 80,
-                                    width: 1, height: 1)
-            pop.permittedArrowDirections = []
-        }
-        present(picker, animated: true)
-    }
-
-  // MARK: – heavy-tool tap (trim)
+  // MARK: trim
   @objc private func trimTapped() {
     Haptics.tap()
-    guard UIVideoEditorController.canEditVideo(atPath: videoURL.path) else {
-      Haptics.error(); return
-    }
+    guard UIVideoEditorController.canEditVideo(atPath: videoURL.path) else { Haptics.error(); return }
     wasPlayingBeforeTrim = player.timeControlStatus == .playing
     player.pause()
-    let editor = UIVideoEditorController()
-    editor.videoPath = videoURL.path
-    editor.videoQuality = .typeHigh
-    editor.delegate = self
-    present(editor, animated: true)
+    let ed = UIVideoEditorController()
+    ed.videoPath = videoURL.path; ed.videoQuality = .typeHigh; ed.delegate = self
+    present(ed, animated: true)
   }
 
-  // MARK: – quick “download” (save to Photos)
-    @objc private func downloadTapped() {
-      Haptics.tap()
-      showLoader("Exporting…")
-      exportVideo { [weak self] url, _ in
-        guard let self else { return }
-        hideLoader()
-        guard let url else { Haptics.error(); return }
-
-        // save to Photos
-        PHPhotoLibrary.requestAuthorization { status in
-          guard status == .authorized || status == .limited else { Haptics.error(); return }
-          PHPhotoLibrary.shared().performChanges({
-            PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-          }) { ok, _ in
-            DispatchQueue.main.async {
-              ok ? self.toast("Saved to Photos") : Haptics.error()
-              if ok { Haptics.ok() }
-            }
-          }
-        }
+  // MARK: download
+  @objc private func downloadTapped() {
+    Haptics.tap(); showLoader("Exporting…")
+    exportVideo { [weak self] url,_ in
+      guard let self else { return }
+      self.hideLoader(); guard let url else { Haptics.error(); return }
+      PHPhotoLibrary.requestAuthorization { status in
+        guard status == .authorized || status == .limited else { Haptics.error(); return }
+        PHPhotoLibrary.shared().performChanges({
+          PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL:url)
+        }) { ok,_ in DispatchQueue.main.async{
+            ok ? self.toast("Saved to Photos") : self.toast("Save failed")
+            ok ? Haptics.ok() : Haptics.error()
+        }}
       }
     }
+  }
 
-
-  // MARK: – “Next” button
-    @objc private func nextPressed() {
-      Haptics.tap()
-      showLoader("Exporting…")
-      exportVideo { [weak self] vidURL, pngURL in
-        guard let self else { return }
-        hideLoader()
-        guard let vidURL else { Haptics.error(); return }
-        // completion pops PostEditorVC; CustomCameraVC then dismisses itself
-          // 1️⃣ Pop the editor itself …
-             self.dismiss(animated: true) {
-               // 2️⃣ … then tell CustomCameraVC we’re done.
-               self.completion?(vidURL, pngURL)
-             }
-      }
+  // MARK: next
+  @objc private func nextPressed() {
+    Haptics.tap(); showLoader("Exporting…")
+    exportVideo { [weak self] vid,_ in
+      guard let self else { return }
+      self.hideLoader(); guard let vid else { Haptics.error(); return }
+      self.dismiss(animated:true){ self.completion?(vid,nil) }
     }
-    
-    
-  // MARK: – background tap
-  @objc private func handleViewTap(_ g: UITapGestureRecognizer) {
+  }
+
+  // MARK: back
+  @objc private func backPressed() {
+    Haptics.error()
+    dismiss(animated:true) {
+      if self.fromGallery,
+         let cam = self.presentingViewController as? CustomCameraVC { cam.openGallery() }
+    }
+  }
+
+  // MARK: bg tap → dismiss keyboard / hide filter bar
+  @objc private func backgroundTapped(_ g: UITapGestureRecognizer) {
     view.endEditing(true)
-    if let bar = filterBar {
-      let pt = g.location(in: view)
-      if !bar.frame.contains(pt) { toggleFilterBar() }
-    }
+    if let fb = filterBar,
+       !fb.frame.contains(g.location(in: view)) { toggleFilterBar() }
   }
 
-  // MARK: – filter bar toggle
+  // MARK: filter bar toggle
   private func toggleFilterBar() {
-    if let bar = filterBar { bar.removeFromSuperview(); filterBar = nil; return }
-
-    let layout = UICollectionViewFlowLayout()
-    layout.scrollDirection = .horizontal
-    layout.itemSize = CGSize(width: 80, height: 34)
-    layout.minimumLineSpacing = 12
-    layout.sectionInset = UIEdgeInsets(top: 0, left: 16, bottom: 0, right: 16)
-
-    let bar = UICollectionView(frame: .zero, collectionViewLayout: layout)
-    bar.backgroundColor = UIColor.black.withAlphaComponent(0.4)
-    bar.layer.cornerRadius = 18
-    bar.showsHorizontalScrollIndicator = false
-    bar.dataSource = self; bar.delegate = self
-    bar.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "chip")
-    bar.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(bar)
-    filterBar = bar
-
+    if let fb = filterBar { fb.removeFromSuperview(); filterBar = nil; return }
+    let lo = UICollectionViewFlowLayout()
+    lo.scrollDirection = .horizontal; lo.itemSize = .init(width:80,height:34)
+    lo.minimumLineSpacing = 12; lo.sectionInset = .init(top:0,left:16,bottom:0,right:16)
+    let fb = UICollectionView(frame:.zero,collectionViewLayout:lo)
+    fb.backgroundColor = UIColor.black.withAlphaComponent(0.4)
+    fb.layer.cornerRadius = 18; fb.showsHorizontalScrollIndicator = false
+    fb.dataSource = self; fb.delegate = self
+    fb.register(UICollectionViewCell.self, forCellWithReuseIdentifier:"chip")
+    fb.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(fb); filterBar = fb
     NSLayoutConstraint.activate([
-      bar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-      bar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-      bar.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -100),
-      bar.heightAnchor.constraint(equalToConstant: 50)
-    ])
+      fb.leadingAnchor.constraint(equalTo:view.leadingAnchor,constant:20),
+      fb.trailingAnchor.constraint(equalTo:view.trailingAnchor,constant:-20),
+      fb.bottomAnchor.constraint(equalTo:view.bottomAnchor,constant:-100),
+      fb.heightAnchor.constraint(equalToConstant:50)])
   }
 
-  // MARK: – live filter preview
-  private func applyFilter(named ciName: String?) {
-    currentFilterName = ciName
+  // MARK: apply filter (live preview)
+  private func applyFilter(named ciName:String?) {
+    currentFilterName = ciName; FilterCompositor.filterName = ciName
     let newItem = AVPlayerItem(asset: playerItem.asset)
-
-    if let name = ciName, let f = CIFilter(name: name) {
-      let comp = AVMutableVideoComposition(asset: playerItem.asset) { req in
+    if let name = ciName, let f = CIFilter(name:name) {
+      let comp = AVMutableVideoComposition(asset: playerItem.asset){ req in
         let src = req.sourceImage.clampedToExtent()
-        f.setValue(src, forKey: kCIInputImageKey)
+        f.setValue(src, forKey:kCIInputImageKey)
         let out = (f.outputImage ?? src).cropped(to: req.sourceImage.extent)
-        req.finish(with: out, context: nil)
-      }
-      if let track = playerItem.asset.tracks(withMediaType: .video).first {
+        req.finish(with: out, context: nil) }
+      if let track = playerItem.asset.tracks(withMediaType:.video).first {
         let s = track.naturalSize.applying(track.preferredTransform)
-        comp.renderSize = CGSize(width: abs(s.width), height: abs(s.height))
-        comp.sourceTrackIDForFrameTiming = track.trackID
-      }
-      newItem.videoComposition = comp
-    }
-    player.replaceCurrentItem(with: newItem)
-    player.actionAtItemEnd = .none
-    NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemDidPlayToEndTime,
-      object: newItem,
-      queue: .main) { [weak self] _ in
-        self?.player.seek(to: .zero); self?.player.play()
-      }
-    player.play()
+        comp.renderSize = .init(width:abs(s.width),height:abs(s.height))
+        comp.sourceTrackIDForFrameTiming = track.trackID }
+      newItem.videoComposition = comp }
+    player.replaceCurrentItem(with:newItem); player.play()
   }
 
-  // MARK: – sticker helper
-  private func addSticker(_ img: UIImage) {
-    let st = DraggableSticker(image: img)
-    st.center = view.center
-    st.actionDelegate = self
-    view.addSubview(st)
-    stickers.append(st)
-  }
+  // MARK: EXPORT
+  private func exportVideo(completion:@escaping(URL?,URL?)->Void){
+    DispatchQueue.global(qos:.userInitiated).async{ [weak self] in
+      guard let self else { return }
 
-  // MARK: – EXPORT (video + thumbnail PNG)
-    // MARK: – EXPORT (video + thumbnail PNG)
-    private func exportVideo(completion: @escaping (URL?, URL?) -> Void) {
-      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-        guard let self = self else { return }
+      // base comp
+      let asset = AVAsset(url:self.videoURL)
+      let comp  = AVMutableComposition()
+      guard let vSrc = asset.tracks(withMediaType:.video).first,
+            let vTrack = comp.addMutableTrack(withMediaType:.video,
+                     preferredTrackID:kCMPersistentTrackID_Invalid) else {
+        DispatchQueue.main.async{ completion(nil,nil) }; return }
+      try? vTrack.insertTimeRange(.init(start:.zero,duration:asset.duration),
+                                  of:vSrc,at:.zero)
+      if let aSrc = asset.tracks(withMediaType:.audio).first,
+         let aTrack = comp.addMutableTrack(withMediaType:.audio,
+                     preferredTrackID:kCMPersistentTrackID_Invalid){
+        try? aTrack.insertTimeRange(.init(start:.zero,duration:asset.duration),
+                                    of:aSrc,at:.zero)
+      }
 
-        // ───────── 1. Build AVMutableComposition (video + audio) ─────────
-        let asset = AVAsset(url: self.videoURL)
-        let comp  = AVMutableComposition()
+      // renderSize = full screen
+      let renderSize = self.overlayContainer.bounds.size
 
-        guard
-          let vSrc   = asset.tracks(withMediaType: .video).first,
-          let vTrack = comp.addMutableTrack(withMediaType: .video,
-                                            preferredTrackID: kCMPersistentTrackID_Invalid)
-        else { DispatchQueue.main.async { completion(nil, nil) }; return }
+      // aspect-fit transform
+      let nat = vSrc.naturalSize.applying(vSrc.preferredTransform)
+      let srcW = abs(nat.width), srcH = abs(nat.height)
+      let scale = min(renderSize.width/srcW, renderSize.height/srcH)
+      let trans = CGAffineTransform(scaleX:scale,y:scale)
+        .concatenating(vSrc.preferredTransform)
+        .concatenating(.init(translationX:(renderSize.width-srcW*scale)/2,
+                             y:(renderSize.height-srcH*scale)/2))
 
-        try? vTrack.insertTimeRange(.init(start: .zero, duration: asset.duration),
-                                    of: vSrc, at: .zero)
-          
-        
-          // ─── 1.  First figure out width/height using the *original* matrix ───
-          let baseSize   = vSrc.naturalSize.applying(vSrc.preferredTransform)
-          let wOriginal  = abs(baseSize.width)
-          let hOriginal  = abs(baseSize.height)
+      let vc = AVMutableVideoComposition()
+      vc.renderSize = renderSize; vc.frameDuration = CMTime(value:1,timescale:30)
+      let instr = AVMutableVideoCompositionInstruction()
+      instr.timeRange = .init(start:.zero,duration:comp.duration)
+      let lInstr = AVMutableVideoCompositionLayerInstruction(assetTrack:vTrack)
+      lInstr.setTransform(trans,at:.zero)
+      instr.layerInstructions = [lInstr]; vc.instructions = [instr]
 
-          // ─── 2.  Build the final transform ───
-          var fixedTransform = vSrc.preferredTransform
-          if fromGallery,
-             fixedTransform.a == -1, fixedTransform.d == -1,
-             fixedTransform.b == 0,  fixedTransform.c == 0 {
-              fixedTransform = CGAffineTransform(scaleX: -1, y: -1)
-                                 .translatedBy(x: wOriginal, y: hOriginal)
-          }
+      // overlays
+      let parent = CALayer(); parent.frame = .init(origin:.zero,size:renderSize)
+      let videoLayer = CALayer(); videoLayer.frame = parent.frame; parent.addSublayer(videoLayer)
 
-          // ─── 3.  *Now* compute oriented size from that final matrix ───
-          let oriented = vSrc.naturalSize.applying(fixedTransform)
-          let w = abs(oriented.width)
-          let h = abs(oriented.height)
-
-          // 4. Apply the transform only ONCE  (compositor *or* metadata, never both)
-          let usingCompositor = (currentFilterName != nil)   // true when a CI filter is picked
-
-          if usingCompositor {
-              // a) A CIFilter is chosen → the custom compositor will rotate the pixels.
-              vTrack.preferredTransform           = .identity          // clear metadata
-              FilterCompositor.preferredTransform = fixedTransform     // compositor gets it
-          } else {
-              // b) No filter → rely on normal AVFoundation metadata path.
-              vTrack.preferredTransform           = fixedTransform     // keep metadata
-              FilterCompositor.preferredTransform = .identity          // compositor not used
-          }
-
-        if let aSrc = asset.tracks(withMediaType: .audio).first,
-           let aTrack = comp.addMutableTrack(withMediaType: .audio,
-                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
-          try? aTrack.insertTimeRange(.init(start: .zero, duration: asset.duration),
-                                      of: aSrc, at: .zero)
-        }
-
-
-        // ───────── 2. AVMutableVideoComposition (rotation + overlays) ─────────
-        let vc = AVMutableVideoComposition()
-        vc.renderSize    = CGSize(width: abs(oriented.width),
-                                  height: abs(oriented.height))
-        vc.frameDuration = CMTime(value: 1, timescale: 30)
-
-        let instr = AVMutableVideoCompositionInstruction()
-        instr.timeRange = .init(start: .zero, duration: comp.duration)
-        let layerInstr  = AVMutableVideoCompositionLayerInstruction(assetTrack: vTrack)
-          
-//        layerInstr.setTransform(fixedTransform, at: .zero)
-        instr.layerInstructions = [layerInstr]
-        vc.instructions         = [instr]
-
-        // ───────── 3. CoreAnimation overlays (captions / stickers) ─────────
-        let parent     = CALayer()
-        parent.frame   = CGRect(origin: .zero, size: vc.renderSize)
-        let videoLayer = CALayer()
-        videoLayer.frame = parent.frame
-        parent.addSublayer(videoLayer)
-
-        let pvFrame = self.playerLayer.frame             // preview size on screen
         func overlay(from v: UIView) -> CALayer {
-          let L = CALayer()
-          L.contents = v.snapshotImage().cgImage
+            let cg = v.snapshotImage().cgImage!
+            let ly = CALayer(); ly.contents = cg
 
-          // convert to preview-local coords
-          var r = v.frame
-          r.origin.x -= pvFrame.minX
-          r.origin.y -= pvFrame.minY
-          let bottomGap = pvFrame.height - (r.minY + r.height)
+            // 1. scale & position   (unchanged)
+            let ov = self.overlayContainer.bounds
+            let sx = renderSize.width  / ov.width
+            let sy = renderSize.height / ov.height
+            ly.bounds   = .init(x: 0, y: 0,
+                                width: v.bounds.width  * sx,
+                                height: v.bounds.height * sy)
+            ly.position = .init(x: v.center.x * sx,
+                                y: (ov.height - v.center.y) * sy)
+            ly.anchorPoint = .init(x: 0.5, y: 0.5)
 
-          // scale into export pixels
-          let sx = vc.renderSize.width  / pvFrame.width
-          let sy = vc.renderSize.height / pvFrame.height
-          L.frame = CGRect(x: r.minX * sx,
-                           y: bottomGap * sy,
-                           width:  r.width  * sx,
-                           height: r.height * sy)
-          return L
+            // 2. rotation & scale   (flip the sign of the angle)
+            let t   = v.transform
+            let rot = atan2(t.b, t.a)          // UIKit angle (clockwise ↓)
+            let sX  = sqrt(t.a*t.a + t.c*t.c)  // X-scale
+            let sY  = sqrt(t.b*t.b + t.d*t.d)  // Y-scale
+
+            ly.setAffineTransform(
+                CGAffineTransform(rotationAngle: -rot)   // ← negate to un-mirror
+                  .scaledBy(x: sX, y: sY)
+            )
+            return ly
         }
-        self.captions.forEach { parent.addSublayer(overlay(from: $0)) }
-        self.stickers.forEach { parent.addSublayer(overlay(from: $0)) }
+      captions.forEach{ parent.addSublayer(overlay(from:$0)) }
+      stickers.forEach{ parent.addSublayer(overlay(from:$0)) }
+      vc.animationTool = AVVideoCompositionCoreAnimationTool(
+                           postProcessingAsVideoLayer:videoLayer, in:parent)
 
-        vc.animationTool = AVVideoCompositionCoreAnimationTool(
-          postProcessingAsVideoLayer: videoLayer,
-          in: parent
-        )
-
-
-          // ───────── 4. Custom compositor (rotation + optional filter) ─────────
-          if let name = currentFilterName {          // a filter is chosen
-              FilterCompositor.filterName        = name
-              vc.customVideoCompositorClass      = FilterCompositor.self
-          } else {                                  // no filter
-              FilterCompositor.filterName = nil
-              layerInstr.setTransform(fixedTransform, at: .zero)   // metadata path
-          }
-          
-        // ───────── 5. Export session ─────────
-        guard let export = AVAssetExportSession(
-                asset: comp,                                  // AVAsset
-                presetName: AVAssetExportPresetHighestQuality)
-        else { DispatchQueue.main.async { completion(nil, nil) }; return }
-
-        let outURL = FileManager.default.temporaryDirectory
-                      .appendingPathComponent(UUID().uuidString + ".mov")
-        export.outputURL        = outURL
-        export.outputFileType   = .mov
-        export.videoComposition = vc                         // overlays + filter
-
-        export.exportAsynchronously {
-          guard export.status == .completed else {
-            DispatchQueue.main.async { completion(nil, nil) }; return
-          }
-
-          // ───────── 6. Thumbnail ─────────
-          let gen = AVAssetImageGenerator(asset: AVAsset(url: outURL))
-          gen.appliesPreferredTrackTransform = true
-          let cg = try? gen.copyCGImage(at: .zero, actualTime: nil)
-          var thumb: URL?
-          if let cg, let data = UIImage(cgImage: cg).pngData() {
-            let u = FileManager.default.temporaryDirectory
-                      .appendingPathComponent(UUID().uuidString + ".png")
-            try? data.write(to: u); thumb = u
-          }
-          DispatchQueue.main.async { completion(outURL, thumb) }
-        }
+      // export
+      guard let ex = AVAssetExportSession(asset:comp,
+                      presetName:AVAssetExportPresetHighestQuality) else {
+        DispatchQueue.main.async{ completion(nil,nil) }; return }
+      let out = FileManager.default.temporaryDirectory
+                 .appendingPathComponent(UUID().uuidString+".mov")
+      ex.outputURL = out; ex.outputFileType = .mov
+      ex.videoComposition = vc; ex.shouldOptimizeForNetworkUse = true
+      ex.exportAsynchronously{
+        ex.status == .completed ?
+          DispatchQueue.main.async{ completion(out,nil) } :
+          DispatchQueue.main.async{ completion(nil,nil) }
       }
     }
+  }
 
-
-
-
-  // MARK: – playback helpers
+  // MARK: reload preview after trimming
   private func reloadPreview(with url: URL) {
     player.pause()
     playerItem = AVPlayerItem(url: url)
     player.replaceCurrentItem(with: playerItem)
-    player.seek(to: .zero); player.play()
-  }
-  private func resumeIfNeeded() {
-    if wasPlayingBeforeTrim { player.seek(to: .zero); player.play() }
-  }
-
-  // MARK: – back
-  @objc private func backPressed() {
-    Haptics.error()
-    dismiss(animated: true) {
-      if self.fromGallery,
-         let cam = self.presentingViewController as? CustomCameraVC {
-        cam.openGallery()
-      }
-    }
+    player.seek(to: .zero)
   }
 }
 
-// MARK: – helpers
-private extension UIView {
-  func snapshotImage() -> UIImage {
-    UIGraphicsImageRenderer(bounds: bounds)
-      .image { ctx in layer.render(in: ctx.cgContext) }
+// ───────────────── helpers / delegates
+private extension UIView{
+  func snapshotImage()->UIImage{
+    UIGraphicsImageRenderer(bounds:bounds).image{ ctx in
+      layer.render(in:ctx.cgContext) }
   }
 }
 
-// MARK: – UITextView auto-size
-extension PostEditorVC: UITextViewDelegate {
-  func textViewDidChange(_ tv: UITextView) {
-    let sz = tv.sizeThatFits(.init(width: view.bounds.width - 40,
-                                   height: .greatestFiniteMagnitude))
+// UITextView auto-size
+extension PostEditorVC:UITextViewDelegate{
+  func textViewDidChange(_ tv:UITextView){
+    let sz = tv.sizeThatFits(.init(width:overlayContainer.bounds.width-40,
+                                   height:.greatestFiniteMagnitude))
     tv.bounds.size = sz
   }
 }
 
-// MARK: – EditableCaption delete
-
+// EditableCaption delegate + colour
 extension PostEditorVC: EditableCaptionDelegate, UIColorPickerViewControllerDelegate {
-
-    // already had this:
-    func captionDidRequestDelete(_ cap: EditableCaption) {
-      Haptics.error()
-      cap.removeFromSuperview()
-      captions.removeAll { $0 === cap }
-    }
-
-    // NEW – colour picker
-    func captionDidRequestColourPicker(_ cap: EditableCaption) {
-        let picker = UIColorPickerViewController()
-        picker.selectedColor = cap.textColor ?? .white
-        picker.delegate      = self
-        colourTarget = cap                     // keep a pointer
-        present(picker, animated: true)
-    }
-
-    // UIColorPicker delegate
-    func colorPickerViewControllerDidSelectColor(_ vc: UIColorPickerViewController) {
-        colourTarget?.textColor = vc.selectedColor
-    }
-    private var colourTarget: EditableCaption? {
-        get { objc_getAssociatedObject(self, &ctKey) as? EditableCaption }
-        set { objc_setAssociatedObject(self, &ctKey, newValue, .OBJC_ASSOCIATION_ASSIGN) }
-    }
+  func captionDidRequestDelete(_ cap: EditableCaption) {
+    Haptics.error(); cap.removeFromSuperview()
+    captions.removeAll{ $0 === cap }
+  }
+  func captionDidRequestColourPicker(_ cap: EditableCaption) {
+    let p = UIColorPickerViewController()
+    p.selectedColor = cap.textColor ?? .white
+    p.delegate = self; colourTarget = cap; present(p, animated: true)
+  }
+  func colorPickerViewControllerDidSelectColor(_ vc: UIColorPickerViewController) {
+    colourTarget?.textColor = vc.selectedColor
+  }
+  private var colourTarget: EditableCaption? {
+    get { objc_getAssociatedObject(self, &ctKey) as? EditableCaption }
+    set { objc_setAssociatedObject(self, &ctKey, newValue, .OBJC_ASSOCIATION_ASSIGN) }
+  }
 }
 private var ctKey = 0
 
-
-// MARK: – DraggableSticker delete
+// DraggableSticker delete
 extension PostEditorVC: DraggableStickerDelegate {
   func stickerDidRequestDelete(_ st: DraggableSticker) {
-    Haptics.error()
-    st.removeFromSuperview()
-    stickers.removeAll { $0 === st }
+    Haptics.error(); st.removeFromSuperview()
+    stickers.removeAll{ $0 === st }
   }
 }
 
-// MARK: – PHPicker delegate
+// Emoji picker
+extension PostEditorVC: EmojiPickerDelegate {
+  func emojiPicker(_ p: EmojiPickerVC, didPick image: UIImage) { addSticker(image) }
+}
+
+// PHPicker
 extension PostEditorVC: PHPickerViewControllerDelegate {
-  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+  func picker(_ picker: PHPickerViewController,
+              didFinishPicking results: [PHPickerResult]) {
     picker.dismiss(animated: true)
     guard let item = results.first?.itemProvider,
           item.canLoadObject(ofClass: UIImage.self) else { return }
-    item.loadObject(ofClass: UIImage.self) { [weak self] obj, _ in
+    item.loadObject(ofClass: UIImage.self) { [weak self] obj,_ in
       guard let self, let img = obj as? UIImage else { return }
       DispatchQueue.main.async { self.addSticker(img) }
     }
   }
 }
 
-// MARK: – filter bar collection
+// filter chips
 extension PostEditorVC: UICollectionViewDataSource, UICollectionViewDelegate {
   func collectionView(_ cv: UICollectionView, numberOfItemsInSection _: Int) -> Int { filters.count }
   func collectionView(_ cv: UICollectionView,
-                      cellForItemAt idx: IndexPath) -> UICollectionViewCell {
-    let cell = cv.dequeueReusableCell(withReuseIdentifier: "chip", for: idx)
-    cell.contentView.subviews.forEach { $0.removeFromSuperview() }
-
-    let l = UILabel(frame: cell.contentView.bounds)
-    l.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    l.font = .systemFont(ofSize: 13, weight: .medium)
+                      cellForItemAt i: IndexPath) -> UICollectionViewCell {
+    let c = cv.dequeueReusableCell(withReuseIdentifier:"chip", for:i)
+    c.contentView.subviews.forEach{ $0.removeFromSuperview() }
+    let l = UILabel(frame:c.contentView.bounds)
+    l.autoresizingMask = [.flexibleWidth,.flexibleHeight]
+    l.font = .systemFont(ofSize:13,weight:.medium)
     l.textAlignment = .center; l.textColor = .white
-    l.text = filters[idx.item].title
-    cell.contentView.addSubview(l)
-
-    cell.backgroundColor = currentFilterName == filters[idx.item].ciName
+    l.text = filters[i.item].title; c.contentView.addSubview(l)
+    c.layer.cornerRadius = 17
+    c.backgroundColor = currentFilterName == filters[i.item].ciName
       ? UIColor.systemPink.withAlphaComponent(0.7)
       : UIColor.darkGray.withAlphaComponent(0.6)
-    cell.layer.cornerRadius = 17
-    return cell
+    return c
   }
-  func collectionView(_ cv: UICollectionView, didSelectItemAt idx: IndexPath) {
-    applyFilter(named: filters[idx.item].ciName)
-    cv.reloadData()
+  func collectionView(_ cv: UICollectionView, didSelectItemAt i: IndexPath) {
+    applyFilter(named: filters[i.item].ciName); cv.reloadData()
   }
 }
 
-// MARK: – Apple trimmer delegate
-extension PostEditorVC: UINavigationControllerDelegate, UIVideoEditorControllerDelegate {
+// Apple Trimmer
+extension PostEditorVC: UINavigationControllerDelegate,
+                         UIVideoEditorControllerDelegate {
   func videoEditorController(_ e: UIVideoEditorController,
                              didSaveEditedVideoToPath path: String) {
     e.dismiss(animated: true) {
@@ -778,20 +541,14 @@ extension PostEditorVC: UINavigationControllerDelegate, UIVideoEditorControllerD
       self.videoURL = newURL
       self.reloadPreview(with: newURL)
       self.applyFilter(named: self.currentFilterName)
-      self.resumeIfNeeded(); Haptics.ok()
+      if self.wasPlayingBeforeTrim { self.player.play() }
+      Haptics.ok()
     }
   }
   func videoEditorControllerDidCancel(_ e: UIVideoEditorController) {
-    e.dismiss(animated: true) { self.resumeIfNeeded() }
+    e.dismiss(animated: true) { if self.wasPlayingBeforeTrim { self.player.play() } }
   }
   func videoEditorController(_ e: UIVideoEditorController, didFailWithError _: Error) {
-    e.dismiss(animated: true) { self.resumeIfNeeded(); Haptics.error() }
+    e.dismiss(animated: true) { if self.wasPlayingBeforeTrim { self.player.play() }; Haptics.error() }
   }
-}
-
-
-extension PostEditorVC: EmojiPickerDelegate {
-    func emojiPicker(_ picker: EmojiPickerVC, didPick image: UIImage) {
-        addSticker(image)          // you already have this helper
-    }
 }
